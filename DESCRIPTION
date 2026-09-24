@@ -1,0 +1,18 @@
+Package: huspmRcpp
+Type: Package
+Title: High-Utility Sequential Pattern Mining with Rcpp
+Version: 0.2.0
+Authors@R: person("OpenAI", "HUSPM", email = "example@example.com", role = c("aut", "cre"))
+Description: High-utility sequential pattern mining for positive-utility single-item events,
+    implemented in R and Rcpp. Supports minimum utility thresholds, Top-K mining,
+    maximum pattern length, and deterministic result ordering.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Imports:
+    Rcpp
+LinkingTo:
+    Rcpp
+Suggests:
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0
