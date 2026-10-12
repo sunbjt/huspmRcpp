@@ -263,3 +263,262 @@ test_that("missing columns are reported", {
   x <- data.frame(sequence_id = 1, item_id = "A")
   expect_error(huspm(x, min_utility = 0), "Missing columns")
 })
+
+test_that("prepare_huspm_data: NA values are rejected", {
+  x <- data.frame(
+    sequence_id = c(1, 1, NA),
+    item_id = c("A", "B", "C"),
+    utility = c(1, 2, 3)
+  )
+  expect_error(prepare_huspm_data(x), "cannot contain NA")
+})
+
+test_that("prepare_huspm_data: non-numeric utility is rejected", {
+  x <- data.frame(
+    sequence_id = c(1, 1),
+    item_id = c("A", "B"),
+    utility = c("1", "2")
+  )
+  expect_error(prepare_huspm_data(x), "must be numeric")
+})
+
+test_that("prepare_huspm_data: non-finite or non-positive utility is rejected", {
+  x1 <- data.frame(
+    sequence_id = c(1, 1),
+    item_id = c("A", "B"),
+    utility = c(1, Inf)
+  )
+  expect_error(prepare_huspm_data(x1), "strictly positive utilities")
+
+  x2 <- data.frame(
+    sequence_id = c(1, 1),
+    item_id = c("A", "B"),
+    utility = c(1, 0)
+  )
+  expect_error(prepare_huspm_data(x2), "strictly positive utilities")
+
+  x3 <- data.frame(
+    sequence_id = c(1, 1),
+    item_id = c("A", "B"),
+    utility = c(1, -1)
+  )
+  expect_error(prepare_huspm_data(x3), "strictly positive utilities")
+})
+
+test_that("prepare_huspm_data: output structure is correct", {
+  x <- data.frame(
+    sequence_id = c(1,1,1, 2,2, 2, 3,3),
+    item_id     = c("A","B","C", "A","B","D", "A","C"),
+    utility     = c(5, 2, 10, 4, 3, 8, 6, 7)
+  )
+  pd <- prepare_huspm_data(x)
+  expect_type(pd, "list")
+  expect_named(pd, c("sequence", "item", "utility", "sequence_labels", "item_labels"))
+  expect_equal(length(pd$sequence), nrow(x))
+  expect_equal(length(pd$item), nrow(x))
+  expect_equal(length(pd$utility), nrow(x))
+  expect_equal(length(pd$sequence_labels), 3L)
+  expect_equal(length(pd$item_labels), 4L)
+})
+
+test_that("prepare_huspm_data: time ordering is respected", {
+  x <- data.frame(
+    sequence_id = c(1,1,1),
+    item_id = c("B","A","C"),
+    utility = c(1, 5, 10),
+    time = c(3, 1, 2)
+  )
+  pd <- prepare_huspm_data(x, time = "time")
+  expect_equal(pd$item_labels[pd$item + 1L], c("A", "C", "B"))
+})
+
+test_that("prepare_huspm_data: ties on time keep input order", {
+  x <- data.frame(
+    sequence_id = c(1,1,1),
+    item_id = c("B","A","C"),
+    utility = c(1, 5, 10),
+    time = c(1, 1, 1)
+  )
+  pd <- prepare_huspm_data(x, time = "time")
+  expect_equal(pd$item_labels[pd$item + 1L], c("B", "A", "C"))
+})
+
+test_that("label rebuilding fallback works for labels containing unit separator", {
+  # Test fallback when one label contains \x1f
+  x <- data.frame(
+    sequence_id = c(1,1, 2,2),
+    item_id = c(paste0("A", "\x1f", "B"), "C", paste0("A", "\x1f", "B"), "D"),
+    utility = c(5, 10, 4, 8)
+  )
+  ans <- huspm(x, min_utility = 0, max_length = 2)
+  expect_s3_class(ans, "huspm")
+  expect_true(any(grepl(paste0("A", "\x1f", "B"), ans$pattern)))
+  expect_true(any(grepl("A", ans$pattern)))
+  # Check that the combined pattern is correctly formatted
+  expect_true(any(ans$pattern == paste0("A", "\x1f", "B", " -> ", "C")))
+})
+
+test_that("item labels with -> in them work correctly", {
+  # This is fine in the vectorized path, but test it anyway
+  x <- data.frame(
+    sequence_id = c(1,1, 2,2),
+    item_id = c("A -> B", "C", "A -> B", "D"),
+    utility = c(5, 10, 4, 8)
+  )
+  ans <- huspm(x, min_utility = 0, max_length = 2)
+  expect_s3_class(ans, "huspm")
+  expect_true(any(grepl("A -> B", ans$pattern)))
+  expect_true(any(ans$pattern == "A -> B -> C"))
+})
+
+# Brute-force oracle for correctness verification
+# Verified to match HUSPM semantics: for each pattern, sum the *maximum* utility
+# embedding per sequence, and support is the number of sequences that have at least
+# one embedding.
+bruteforce_huspm <- function(data, min_utility, max_length, min_support, include_singletons) {
+  # Prepare data
+  x <- prepare_huspm_data(data)
+  n_seqs <- length(x$sequence_labels)
+
+  # Extract per-sequence items and utilities (item ids are 0-based matching x$item)
+  seqs <- list()
+  for (s in seq_len(n_seqs)) {
+    idx <- which(x$sequence == (s - 1L))
+    seqs[[s]] <- data.frame(
+      item = x$item[idx],
+      util = x$utility[idx],
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # List to collect total results
+  # each entry: list(total_utility, support)
+  # name: comma-separated 0-based item ids
+  total_results <- list()
+
+  # Recursive search per sequence
+  # For each sequence, generate all possible patterns and keep max utility
+  # Then accumulate across all sequences
+  for (s in seq_len(n_seqs)) {
+    seq <- seqs[[s]]
+    n <- nrow(seq)
+    # Track maximum utility for each pattern in this sequence - use environment for pass-by-reference
+    seq_max <- new.env(hash = TRUE)
+
+    recurse <- function(last_idx, pattern, current_util) {
+      len <- length(pattern)
+      if (len > 0) {
+        key <- paste(pattern, collapse = ",")
+        if (!exists(key, envir = seq_max) || current_util > get(key, envir = seq_max)) {
+          assign(key, current_util, envir = seq_max)
+        }
+      }
+
+      if (len >= max_length) return()
+
+      # Extend with any item after last_idx: last_idx is 1-based position in this sequence
+      start <- if (len == 0) 1 else last_idx + 1L
+      if (start <= n) {
+        for (i in start:n) {
+          # i is position, item value is seq$item[i]
+          new_util <- current_util + seq$util[i]
+          new_pattern <- c(pattern, seq$item[i])
+          recurse(i, new_pattern, new_util)
+        }
+      }
+    }
+
+    recurse(0, integer(0), 0.0)
+
+    # After processing the entire sequence, add the max for each pattern to the total
+    for (key in ls(seq_max)) {
+      max_util <- get(key, envir = seq_max)
+      if (!(key %in% names(total_results))) {
+        total_results[[key]] <- list(total_utility = max_util, support = 1L)
+      } else {
+        total_results[[key]]$total_utility <- total_results[[key]]$total_utility + max_util
+        total_results[[key]]$support <- total_results[[key]]$support + 1L
+      }
+    }
+  }
+
+  # Build result data frame
+  keys <- names(total_results)
+  if (!length(keys)) {
+    return(huspmRcpp:::empty_huspm())
+  }
+
+  res_df <- do.call(rbind, lapply(keys, function(key) {
+    items <- as.integer(strsplit(key, ",")[[1]])
+    pattern <- paste(x$item_labels[items + 1L], collapse = " -> ")
+    total_util <- total_results[[key]]$total_utility
+    support <- total_results[[key]]$support
+    data.frame(
+      pattern = pattern,
+      length = length(items),
+      utility = total_util,
+      support = support,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # Filter based on parameters
+  if (!include_singletons) {
+    res_df <- res_df[res_df$length > 1, , drop = FALSE]
+  }
+  res_df <- res_df[res_df$utility >= min_utility & res_df$support >= min_support, , drop = FALSE]
+
+  if (nrow(res_df) == 0) {
+    return(empty_huspm())
+  }
+
+  # Compute utility ratio and sort
+  res_df$utility_ratio <- res_df$utility / sum(x$utility)
+  # Sort order matches main algorithm: utility descending, length ascending, pattern ascending
+  res_df <- res_df[order(-res_df$utility, res_df$length, res_df$pattern),
+                   c("pattern", "length", "utility", "support", "utility_ratio")]
+  rownames(res_df) <- NULL
+  class(res_df) <- c("huspm", "data.frame")
+  return(res_df)
+}
+
+test_that("results match brute-force oracle on small random data", {
+  set.seed(42)
+  for (i in 1:10) {
+    # Small dataset so brute force can enumerate everything
+    n_seqs <- sample(2:4, 1)
+    n_items <- sample(3:5, 1)
+    max_len <- sample(2:3, 1)
+    x <- do.call(rbind, lapply(1:n_seqs, function(s) {
+      n <- sample(2:5, 1)
+      data.frame(
+        sequence_id = s,
+        item_id = sample(LETTERS[1:n_items], n, replace = TRUE),
+        utility = sample(1:5, n, replace = TRUE)
+      )
+    }))
+    huspm_res <- huspm(x, min_utility = 0, max_length = max_len, min_support = 1)
+    bf_res <- bruteforce_huspm(x, min_utility = 0, max_length = max_len,
+                               min_support = 1, include_singletons = TRUE)
+
+    expect_equal(nrow(huspm_res), nrow(bf_res))
+    expect_equal(huspm_res$pattern, bf_res$pattern)
+    expect_equal(huspm_res$utility, bf_res$utility, tolerance = 1e-8)
+    expect_equal(huspm_res$support, bf_res$support)
+  }
+})
+
+test_that("results match brute-force with min_utility and min_support filtering", {
+  set.seed(123)
+  x <- data.frame(
+    sequence_id = c(1,1,1, 2,2, 2, 3,3),
+    item_id     = c("A","B","C", "A","B","D", "A","C"),
+    utility     = c(5, 2, 10, 4, 3, 8, 6, 7)
+  )
+  huspm_res <- huspm(x, min_utility = 15, max_length = 3, min_support = 1)
+  bf_res <- bruteforce_huspm(x, min_utility = 15, max_length = 3,
+                             min_support = 1, include_singletons = TRUE)
+  expect_equal(nrow(huspm_res), nrow(bf_res))
+  expect_equal(huspm_res$pattern, bf_res$pattern)
+  expect_equal(huspm_res$utility, bf_res$utility)
+})

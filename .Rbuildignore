@@ -1,0 +1,4 @@
+^\.claude$
+^.*\.Rproj$
+^\.Rproj\.user$
+^\.Rbuildignore$

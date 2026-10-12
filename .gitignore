@@ -1,0 +1,50 @@
+# Generated files
+.Rproj.user
+.Rhistory
+.RData
+.RDataTmp
+*.rds
+*.RData
+
+# Package files
+*.tar.gz
+*.zip
+inst/doc/*.html
+inst/doc/*.pdf
+inst/doc/*.R
+inst/doc/*.md
+
+# Documentation
+man/*.Rd
+NAMESPACE
+*.tar.gz
+
+# Compiled files
+src/*.o
+src/*.so
+src/*.dll
+src/*.dSYM
+
+# RStudio
+*.Rproj
+.Rproj.user/
+
+# macOS
+.DS_Store
+.AppleDouble
+Icon
+
+# Emacs
+*~
+\#*\#
+/.#*
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Claude
+.claude/

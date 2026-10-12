@@ -29,6 +29,8 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <future>
+#include <mutex>
 
 using namespace Rcpp;
 
@@ -114,6 +116,7 @@ class HUSPM {
     cand_ub.assign(nitems, 0.0);
     cand_supp.assign(nitems, 0);
     surv_index.assign(nitems, -1);
+    surv_best.assign(nitems, -1.0);
   }
 
   void run() {
@@ -126,6 +129,11 @@ class HUSPM {
     }
 
     const int root_budget = max_len - 1;
+
+    // Collect items that need processing (non-empty occurrence list and pass threshold)
+    std::vector<std::pair<int, StateTable>> root_jobs;
+    std::vector<double> root_util;
+    std::vector<int> root_support;
     for (int x = 0; x < nitems; ++x) {
       if (occ[x].empty()) continue;
 
@@ -155,11 +163,152 @@ class HUSPM {
       }
       st.gstart.push_back((int)st.data.size());
 
+      // Check if we need to process this root at all
+      bool need_process = false;
+      if (include_singletons || max_len > 1) {
+        double ub = util_sum;
+        if (max_len > 1) {
+          ub += table_ub(st, root_budget);
+        }
+        if (ub + eps() >= threshold()) {
+          need_process = true;
+        }
+      }
+      if (need_process || include_singletons) {
+        root_jobs.emplace_back(x, std::move(st));
+        root_util.push_back(util_sum);
+        root_support.push_back(support);
+      }
+    }
+
+    // If we only have a few root jobs, process serially
+    if (root_jobs.empty()) {
+      return;
+    }
+
+    const size_t n_jobs = root_jobs.size();
+    if (n_jobs == 1) {
+      // Single job - process serially
+      const int x = root_jobs[0].first;
+      StateTable& st = root_jobs[0].second;
+      const double util_sum = root_util[0];
+      const int support = root_support[0];
       path.assign(1, x);
-      // Singletons are emitted only when asked for, but are always recursed into.
       if (include_singletons) emit(util_sum, support);
       if (max_len > 1 && table_ub(st, root_budget) + eps() >= threshold()) node(st);
       path.clear();
+      return;
+    }
+
+    // Parallel processing of root jobs: each root job gets its own thread because
+    // processing is completely independent and there's no shared mutable state.
+    std::vector<std::future<HUSPM>> futures;
+    futures.reserve(n_jobs);
+
+    for (size_t j = 0; j < n_jobs; ++j) {
+      const int x = root_jobs[j].first;
+      StateTable st = std::move(root_jobs[j].second);
+      const double util_sum = root_util[j];
+      const int support = root_support[j];
+
+      // Copy the original instance immediately, before any merging has happened,
+      // so we get a pristine copy with empty results/heap. If we don't do this now,
+      // a concurrent merge could happen before the async lambda runs, and we'd get
+      // duplicate items from earlier processing.
+      HUSPM worker_original = *this;
+
+      futures.push_back(std::async(std::launch::async, [worker_original, x, st = std::move(st), util_sum, support, root_budget]() mutable -> HUSPM {
+        // We already have a pristine copy of the original HUSPM instance so this
+        // thread has its own copy. All parameters are copied from the original, and
+        // we just need to replace the scratch buffers with newly allocated ones that are
+        // thread-local.
+
+        // We need our own copies of scratch buffers because they get modified during
+        // node processing. Each thread works on its own roots independently, so
+        // they don't interfere.
+        std::vector<int> local_path;
+        local_path.assign(1, x);
+        worker_original.path.swap(local_path);
+
+        // Reset the scratch buffers to be empty/cleared for this thread's use
+        worker_original.seq_seen.assign(worker_original.nitems, 0);
+        worker_original.seq_best_util.assign(worker_original.nitems, 0.0);
+        worker_original.seq_best_ub.assign(worker_original.nitems, 0.0);
+        worker_original.cand_seen.assign(worker_original.nitems, 0);
+        worker_original.cand_util.assign(worker_original.nitems, 0.0);
+        worker_original.cand_ub.assign(worker_original.nitems, 0.0);
+        worker_original.cand_supp.assign(worker_original.nitems, 0);
+        worker_original.cand_list.clear();
+        worker_original.survivors.clear();
+        worker_original.surv_best.assign(worker_original.nitems, -1.0);
+        worker_original.surv_index.assign(worker_original.nitems, -1);
+        worker_original.surv_touched.clear();
+
+        // Emit singleton if requested
+        if (worker_original.include_singletons) {
+          if (support >= worker_original.min_support && util_sum + 1e-9 * std::max(1.0, std::fabs(worker_original.threshold())) >= worker_original.threshold()) {
+            if (worker_original.use_topk) {
+              HeapItem hi;
+              hi.pattern = worker_original.path;
+              hi.utility = util_sum;
+              hi.support = support;
+              worker_original.heap.push_back(std::move(hi));
+              std::push_heap(worker_original.heap.begin(), worker_original.heap.end(), heap_cmp);
+              if ((int)worker_original.heap.size() > worker_original.top_k) {
+                std::pop_heap(worker_original.heap.begin(), worker_original.heap.end(), heap_cmp);
+                worker_original.heap.pop_back();
+              }
+            } else {
+              const int off = (int)worker_original.arena.size();
+              worker_original.arena.insert(worker_original.arena.end(), worker_original.path.begin(), worker_original.path.end());
+              worker_original.results.push_back(Result{off, (int)worker_original.path.size(), util_sum, support});
+            }
+          }
+        }
+
+        // Recurse if there's room and we pass the bound
+        if (worker_original.max_len > 1 && worker_original.table_ub(st, root_budget) + worker_original.eps() >= worker_original.threshold()) {
+          worker_original.node(st);
+        }
+
+        return worker_original;
+      }));
+    }
+
+    // Collect results from all threads and merge into final output
+    std::mutex results_mutex;
+    for (auto& future : futures) {
+      HUSPM worker = future.get();
+      std::lock_guard<std::mutex> lock(results_mutex);
+      if (use_topk) {
+        // Merge heap items into the global heap
+        for (auto& item : worker.heap) {
+          heap.push_back(std::move(item));
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+          if ((int)heap.size() > top_k) {
+            std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+            heap.pop_back();
+          }
+        }
+      } else {
+        // Append results and arena
+        size_t offset = arena.size();
+        for (auto& res : worker.results) {
+          // The pattern offsets in worker results are relative to worker.arena. We need
+          // to adjust them to point into the global arena.
+          Result shifted = res;
+          shifted.offset += offset;
+          results.push_back(shifted);
+        }
+        arena.insert(arena.end(), worker.arena.begin(), worker.arena.end());
+        // Check for excessive memory usage in exhaustive mode
+        const size_t max_arena_bytes = 500000000; // 500MB
+        if (arena.size() * sizeof(int) > max_arena_bytes) {
+          stop("Excessive memory usage in exhaustive mining: "
+               "pattern arena exceeds 500MB. "
+               "Use the 'top_k' parameter to limit the number of output patterns.");
+        }
+      }
     }
   }
 
@@ -248,6 +397,24 @@ class HUSPM {
     // max_length on a long database allocates O(max_length * events).
     bmax = std::min(max_len, max_seq_len);
     gtab.resize(nseq);
+    // Check total allocation size to avoid out-of-memory
+    // 1GB (1e9 bytes) is a reasonable upper bound
+    const size_t max_total_bytes = 1000000000;
+    size_t total_bytes = 0;
+    for (int s = 0; s < nseq; ++s) {
+      const int n = (int)items[s].size();
+      const size_t bytes = sizeof(double) * (size_t)(bmax + 1) * (n + 1);
+      if (bytes > max_total_bytes) {
+        stop("A single sequence is too long for the given max_length. "
+             "Total allocation for bound table exceeds 1GB.");
+      }
+      total_bytes += bytes;
+      if (total_bytes > max_total_bytes) {
+        stop("Total allocation for bound table exceeds 1GB. "
+             "Try reducing max_length or filtering shorter sequences.");
+      }
+    }
+    // Allocate now that we've checked the size
     for (int s = 0; s < nseq; ++s) {
       const int n = (int)items[s].size();
       const int stride = n + 1;
@@ -304,6 +471,13 @@ class HUSPM {
       const int off = (int)arena.size();
       arena.insert(arena.end(), path.begin(), path.end());
       results.push_back(Result{off, (int)path.size(), utility, support});
+      // Check for excessive memory usage in exhaustive mode
+      const size_t max_arena_bytes = 500000000; // 500MB
+      if (arena.size() * sizeof(int) > max_arena_bytes) {
+        stop("Excessive memory usage in exhaustive mining: "
+             "pattern arena exceeds 500MB. "
+             "Use the 'top_k' parameter to limit the number of output patterns.");
+      }
     }
   }
 
@@ -323,6 +497,7 @@ class HUSPM {
   }
 
   void node(const StateTable& st) {
+    checkUserInterrupt();
     const int L = (int)path.size();
     if (L >= max_len) return;
     const int budget = max_len - L - 1;  // slots left AFTER appending one item
@@ -404,13 +579,14 @@ class HUSPM {
     }
     cand_list.clear();
 
-    if (survivors.empty() || L + 1 >= max_len) return;
+    // Clear the whole map before recursing, not one entry per iteration: a child
+    // node reads surv_index while materializing its own states, and would
+    // otherwise pick up our entries for items it does not track. Clearing all of
+    // them up front also keeps the invariant that surv_index is entirely -1 on
+    // entry to (and exit from) every node.
+    for (int j = 0; j < nitems; ++j) surv_index[j] = -1;
 
-    // ---- materialize child states: one walk covering all survivors -----------
-    // Each position feeds at most one candidate, so the total number of states
-    // built here is bounded by the number of events -- O(events) memory, not
-    // O(#survivors * events).
-    const int ns = (int)survivors.size();
+    int ns = (int)survivors.size();
     std::vector<Builder> bd(ns);  // local: `survivors` itself is not safe to read below
     surv_best.assign(ns, -1.0);
     for (int j = 0; j < ns; ++j) {

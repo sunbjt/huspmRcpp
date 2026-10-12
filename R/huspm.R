@@ -1,11 +1,18 @@
-#' Prepare sequence data for HUSPM
+#' 预处理高效用频繁序列挖掘的输入数据
 #'
-#' @param data data.frame with sequence_id, item_id, utility.
-#' @param sequence_id column name for sequence id.
-#' @param item_id column name for item id.
-#' @param utility column name for positive utility.
-#' @param time optional column name used to order events within each sequence.
-#' @return A list suitable for the C++ backend.
+#' 将输入数据框转换为算法需要的内部格式。输入数据框必须包含序列ID、项目ID和项目效用。
+#'
+#' @param data 输入数据框，包含 `sequence_id`, `item_id`, `utility` 列。
+#' @param sequence_id 表示序列ID的列名。
+#' @param item_id 表示项目ID的列名。
+#' @param utility 表示项目效用（权重）的列名。
+#' @param time 可选列名，用于排序同一个序列中的事件顺序。如果不提供，则按输入数据的顺序排序。
+#' @return 包含以下组件的列表：
+#'   \item{sequence}{0-based整数序列ID}
+#'   \item{item}{0-based整数项目ID}
+#'   \item{utility}{数值型项目效用}
+#'   \item{sequence_labels}{原始序列标签字符向量}
+#'   \item{item_labels}{原始项目标签字符向量}
 #' @export
 prepare_huspm_data <- function(data,
                                 sequence_id = "sequence_id",
@@ -55,30 +62,36 @@ prepare_huspm_data <- function(data,
   )
 }
 
-#' High-Utility Sequential Pattern Mining
+#' 高效用频繁序列模式挖掘 (High-Utility Sequential Pattern Mining)
 #'
-#' Pattern utility is defined as the sum over sequences of the maximum-utility
-#' embedding of the pattern in that sequence. Utilities must be positive.
+#' 挖掘数据集中所有满足最小效用阈值的序列模式。模式效用定义为每个序列中该模式的最大嵌入效用之和。
+#' 所有输入项目的效用必须为正。
 #'
-#' Patterns are returned in a deterministic order: utility descending, then
-#' length ascending, then pattern lexicographic ascending.
+#' 挖掘结果按以下规则确定顺序：先按模式效用降序排列，再按模式长度升序排列，最后按模式字典序升序排列。
 #'
-#' @param data data.frame containing sequence_id, item_id, utility.
-#' @param min_utility minimum total pattern utility; one finite non-negative number.
-#' @param top_k if supplied, keep only the top K patterns. "Top K" means the first
-#'   K patterns of the output order above, so ties are resolved by the same rule
-#'   rather than by discovery order.
-#' @param max_length maximum number of items in a pattern.
-#' @param sequence_id sequence identifier column.
-#' @param item_id item identifier column.
-#' @param utility utility column.
-#' @param time optional ordering column.
-#' @param min_support optional minimum number of sequences containing a pattern.
-#' @param include_singletons include 1-item patterns.
-#' @return data.frame with pattern, length, utility, support, utility_ratio.
+#' 当有多个根项目时，算法会自动利用多线程并行处理每个根项目，自动利用多个CPU核心加速计算。
+#'
+#' @param data 输入数据框，包含 `sequence_id`, `item_id`, `utility` 列。
+#' @param min_utility 最小总模式效用，必须是一个有限非负数。所有满足条件的模式都会被输出。
+#' @param top_k 如果提供，则只保留前 K 个满足条件的模式。这里的"前 K"指的是按输出顺序保留前 K 个，
+#'   因此平局会按照相同规则解决，而不是按照发现顺序。如果不提供，会输出所有满足条件的模式。
+#' @param max_length 模式中允许的最大项目个数，必须是正整数。
+#' @param sequence_id 表示序列ID的列名。
+#' @param item_id 表示项目ID的列名。
+#' @param utility 表示项目效用（权重）的列名。
+#' @param time 可选列名，用于排序同一个序列中的事件顺序。如果不提供，则按输入数据的顺序排序。
+#' @param min_support 可选参数，表示一个模式至少需要出现在多少个不同序列中才能被保留。必须是正整数。
+#' @param include_singletons 是否输出长度为1的单项目模式。默认为 TRUE。
+#' @return 数据框，包含以下列：
+#'   \item{pattern}{字符型模式标签，项目之间用 ` -> ` 分隔}
+#'   \item{length}{整型，模式中包含的项目个数}
+#'   \item{utility}{数值型，模式的总效用（每个序列中最大嵌入效用之和）}
+#'   \item{support}{整型，包含这个模式的序列个数}
+#'   \item{utility_ratio}{数值型，模式总效用除以所有输入事件效用之和。注意：由于模式效用是每个序列中的最大嵌入，
+#'     分母是所有输入事件的总和，因此这个比例不会加起来等于 1.0，并且可能会对出现在多个模式中的事件重复计数。}
 #' @export
 huspm <- function(data,
-                  min_utility,
+                  min_utility = 0,
                   top_k = NULL,
                   max_length = 5L,
                   sequence_id = "sequence_id",
@@ -96,12 +109,17 @@ huspm <- function(data,
       stop("top_k must be a positive integer or NULL.")
     top_k <- as.integer(top_k)
   }
+  if (!is.numeric(max_length) || length(max_length) != 1L || max_length != as.integer(max_length) || max_length < 1L) {
+    stop("max_length must be a positive integer.")
+  }
   max_length <- as.integer(max_length)
-  if (length(max_length) != 1L || max_length < 1L)
-    stop("max_length must be >= 1.")
+  if (!is.numeric(min_support) || length(min_support) != 1L || min_support != as.integer(min_support) || min_support < 1L) {
+    stop("min_support must be a positive integer.")
+  }
   min_support <- as.integer(min_support)
-  if (length(min_support) != 1L || min_support < 1L)
-    stop("min_support must be >= 1.")
+  if (!is.logical(include_singletons) || length(include_singletons) != 1L || is.na(include_singletons)) {
+    stop("include_singletons must be TRUE or FALSE.")
+  }
 
   x <- prepare_huspm_data(data, sequence_id, item_id, utility, time)
 
@@ -119,7 +137,7 @@ huspm <- function(data,
     top_k = if (is.null(top_k)) 0L else top_k,
     max_length = max_length,
     min_support = min_support,
-    include_singletons = isTRUE(include_singletons)
+    include_singletons = include_singletons
   )
 
   if (!nrow(out)) return(empty_huspm())
@@ -146,6 +164,8 @@ huspm <- function(data,
   out$utility_ratio <- out$utility / sum(x$utility)
 
   out <- out[, c("pattern", "length", "utility", "support", "utility_ratio")]
+  # Re-sort to match documented ordering: utility descending, length ascending, pattern ascending
+  out <- out[order(-out$utility, out$length, out$pattern), ]
   rownames(out) <- NULL
   class(out) <- c("huspm", "data.frame")
   out
@@ -162,14 +182,24 @@ empty_huspm <- function() {
   )
 }
 
-#' Print a huspm result
+#' 打印 huspm 挖掘结果
 #'
-#' @param x a `huspm` object.
-#' @param ... passed on to [print.data.frame()].
-#' @return `x`, invisibly.
+#' @param x `huspm` 对象。
+#' @param max_rows 最多打印多少个模式。默认为 20，使用 `max_rows = Inf` 打印所有结果。
+#' @param ... 传递给 `print.data.frame()` 的额外参数。
+#' @return 原对象 `x`，不可见返回。
+#' @importFrom utils head
 #' @export
-print.huspm <- function(x, ...) {
+print.huspm <- function(x, max_rows = 20, ...) {
   cat("<huspm> ", nrow(x), " patterns\n", sep = "")
-  if (nrow(x)) print.data.frame(x, row.names = FALSE, ...)
+  if (nrow(x) > 0) {
+    if (!is.infinite(max_rows) && nrow(x) > max_rows) {
+      x_head <- head(x, max_rows)
+      print.data.frame(x_head, row.names = FALSE, ...)
+      cat("... (", nrow(x) - max_rows, " more rows omitted, use max_rows = Inf to see all)\n", sep = "")
+    } else {
+      print.data.frame(x, row.names = FALSE, ...)
+    }
+  }
   invisible(x)
 }
